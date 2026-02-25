@@ -366,7 +366,7 @@ void dump_lib(const char *outDir) {
         while (fgets(line, sizeof(line), fp)) {
             if (strstr(line, "libil2cpp.so")) {
                 uintptr_t s, e;
-                if (sscanf(line, "%lx-%lx", &s, &e) == 2) {
+                if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &s, &e) == 2) {
                     if (s == start || (s > start && (end == 0 || s == end))) {
                         end = e;
                     }
