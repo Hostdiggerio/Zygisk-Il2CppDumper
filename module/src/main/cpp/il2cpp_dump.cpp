@@ -11,6 +11,7 @@
 #include <vector>
 #include <sstream>
 #include <fstream>
+#include <cstdio>
 #include <unistd.h>
 #include "xdl.h"
 #include "log.h"
@@ -92,6 +93,13 @@ bool _il2cpp_type_is_byref(const Il2CppType *type) {
     return byref;
 }
 
+struct MethodData {
+    uint64_t rva;
+    std::string name;
+};
+
+static std::vector<MethodData> methodList;
+
 std::string dump_method(Il2CppClass *klass) {
     std::stringstream outPut;
     outPut << "\n\t// Methods\n";
@@ -99,10 +107,15 @@ std::string dump_method(Il2CppClass *klass) {
     while (auto method = il2cpp_class_get_methods(klass, &iter)) {
         //TODO attribute
         if (method->methodPointer) {
+            uint64_t rva = (uint64_t) method->methodPointer - il2cpp_base;
             outPut << "\t// RVA: 0x";
-            outPut << std::hex << (uint64_t) method->methodPointer - il2cpp_base;
+            outPut << std::hex << rva;
             outPut << " VA: 0x";
             outPut << std::hex << (uint64_t) method->methodPointer;
+
+            std::string className = il2cpp_class_get_name(klass);
+            std::string methodName = il2cpp_method_get_name(method);
+            methodList.push_back({rva, className + "$$" + methodName});
         } else {
             outPut << "\t// RVA: 0x VA: 0x0";
         }
@@ -343,8 +356,47 @@ void il2cpp_api_init(void *handle) {
     il2cpp_thread_attach(domain);
 }
 
+void dump_lib(const char *outDir) {
+    LOGI("dumping libil2cpp.so...");
+    uint64_t start = il2cpp_base;
+    uint64_t end = 0;
+    char line[1024];
+    FILE *fp = fopen("/proc/self/maps", "rt");
+    if (fp) {
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, "libil2cpp.so")) {
+                uintptr_t s, e;
+                if (sscanf(line, "%lx-%lx", &s, &e) == 2) {
+                    if (s == start || (s > start && (end == 0 || s == end))) {
+                        end = e;
+                    }
+                }
+            }
+        }
+        fclose(fp);
+    }
+
+    if (end > start) {
+        size_t size = end - start;
+        auto outPath = std::string(outDir).append("/files/libil2cpp.so");
+        FILE *out = fopen(outPath.c_str(), "wb");
+        if (out) {
+            fwrite((void *)start, 1, size, out);
+            fclose(out);
+            LOGI("libil2cpp.so dumped, size: %zu", size);
+        } else {
+            LOGE("Failed to open libil2cpp.so for writing");
+        }
+    } else {
+        LOGE("Failed to find libil2cpp.so memory range");
+    }
+}
+
 void il2cpp_dump(const char *outDir) {
     LOGI("dumping...");
+    methodList.clear();
+    dump_lib(outDir);
+
     size_t size;
     auto domain = il2cpp_domain_get();
     auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
@@ -402,8 +454,8 @@ void il2cpp_dump(const char *outDir) {
             auto imageNameNoExt = imageName.substr(0, pos);
             auto assemblyFileName = il2cpp_string_new(imageNameNoExt.data());
             auto reflectionAssembly = ((Assembly_Load_ftn) assemblyLoad->methodPointer)(nullptr,
-                                                                                        assemblyFileName,
-                                                                                        nullptr);
+                                                                                         assemblyFileName,
+                                                                                         nullptr);
             auto reflectionTypes = ((Assembly_GetTypes_ftn) assemblyGetTypes->methodPointer)(
                     reflectionAssembly, nullptr);
             auto items = reflectionTypes->vector;
@@ -425,5 +477,29 @@ void il2cpp_dump(const char *outDir) {
         outStream << outPuts[i];
     }
     outStream.close();
+
+    LOGI("write script.json");
+    auto scriptPath = std::string(outDir).append("/files/script.json");
+    std::ofstream scriptStream(scriptPath);
+    scriptStream << "{\n  \"Script\": [\n";
+    for (size_t i = 0; i < methodList.size(); ++i) {
+        scriptStream << "    {\n";
+        scriptStream << "      \"Address\": " << std::dec << methodList[i].rva << ",\n";
+        scriptStream << "      \"Name\": \"" << methodList[i].name << "\"\n";
+        scriptStream << "    }";
+        if (i < methodList.size() - 1) scriptStream << ",";
+        scriptStream << "\n";
+    }
+    scriptStream << "  ]\n}";
+    scriptStream.close();
+
+    LOGI("write names.csv");
+    auto csvPath = std::string(outDir).append("/files/names.csv");
+    std::ofstream csvStream(csvPath);
+    for (size_t i = 0; i < methodList.size(); ++i) {
+        csvStream << std::dec << methodList[i].rva << "," << methodList[i].name << "\n";
+    }
+    csvStream.close();
+
     LOGI("dump done!");
 }
