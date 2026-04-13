@@ -13,6 +13,7 @@
 #include <fstream>
 #include <cstdio>
 #include <unistd.h>
+#include <fcntl.h>
 #include "xdl.h"
 #include "log.h"
 #include "il2cpp-tabledefs.h"
@@ -357,45 +358,107 @@ void il2cpp_api_init(void *handle) {
 }
 
 void dump_lib(const char *outDir) {
-    LOGI("dumping libil2cpp.so...");
-    uint64_t start = il2cpp_base;
-    uint64_t end = 0;
+    LOGI("dumping libil2cpp.so entirely from memory...");
+    auto outPath = std::string(outDir).append("/files/libil2cpp.so");
+    FILE *out = fopen(outPath.c_str(), "wb");
+    if (!out) {
+        LOGE("Failed to open libil2cpp.so for writing");
+        return;
+    }
+
     char line[1024];
     FILE *fp = fopen("/proc/self/maps", "rt");
-    if (fp) {
-        while (fgets(line, sizeof(line), fp)) {
-            if (strstr(line, "libil2cpp.so")) {
-                uintptr_t s, e;
-                if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &s, &e) == 2) {
-                    if (s == start || (s > start && (end == 0 || s == end))) {
-                        end = e;
-                    }
+    if (!fp) {
+        LOGE("Failed to open /proc/self/maps");
+        fclose(out);
+        return;
+    }
+
+    uintptr_t lib_base = il2cpp_base;
+    uintptr_t max_end = 0;
+
+    // First pass: find the maximum address mapped to libil2cpp.so
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "libil2cpp.so")) {
+            uintptr_t s, e;
+            if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &s, &e) == 2) {
+                if (e > max_end) {
+                    max_end = e;
                 }
             }
         }
-        fclose(fp);
     }
 
-    if (end > start) {
-        size_t size = end - start;
-        auto outPath = std::string(outDir).append("/files/libil2cpp.so");
-        FILE *out = fopen(outPath.c_str(), "wb");
-        if (out) {
-            fwrite((void *)start, 1, size, out);
-            fclose(out);
-            LOGI("libil2cpp.so dumped, size: %zu", size);
-        } else {
-            LOGE("Failed to open libil2cpp.so for writing");
+    size_t total_size = max_end - lib_base;
+    LOGI("Total libil2cpp.so memory size roughly: %zu", total_size);
+
+    fseek(fp, 0, SEEK_SET);
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "libil2cpp.so")) {
+            uintptr_t s, e;
+            if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &s, &e) == 2) {
+                if (s >= lib_base && s < max_end) {
+                    size_t region_size = e - s;
+                    size_t file_offset = s - lib_base;
+                    
+                    fseek(out, file_offset, SEEK_SET);
+                    fwrite((void*)s, 1, region_size, out);
+                }
+            }
         }
-    } else {
-        LOGE("Failed to find libil2cpp.so memory range");
     }
+
+    fclose(fp);
+    fclose(out);
+    LOGI("libil2cpp.so fully dumped! Final size: %zu", total_size);
+}
+
+void dump_metadata(const char *outDir) {
+    LOGI("dumping global-metadata.dat...");
+    char line[1024];
+    FILE *fp = fopen("/proc/self/maps", "rt");
+    if (!fp) return;
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (!strstr(line, "r-") && !strstr(line, "r+")) continue;
+        
+        uintptr_t s, e;
+        if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &s, &e) == 2) {
+            size_t size = e - s;
+            if (size > 20000000 || size < 500000) continue; // Typical metadata is 1MB - 10MB
+            
+            int pipe_fds[2];
+            if (pipe(pipe_fds) == 0) {
+                if (write(pipe_fds[1], (void*)s, 8) == 8) {
+                    uint8_t* ptr = (uint8_t*)s;
+                    if (ptr[0] == 0xAF && ptr[1] == 0x1B && ptr[2] == 0xB1 && ptr[3] == 0xFA) {
+                        uint32_t version = *(uint32_t*)(ptr + 4);
+                        if (version >= 24) {
+                            LOGI("Found global-metadata.dat at %p, version %u", ptr, version);
+                            auto outPath = std::string(outDir).append("/files/global-metadata.dat");
+                            FILE* out_meta = fopen(outPath.c_str(), "wb");
+                            if (out_meta) {
+                                fwrite((void*)s, 1, size, out_meta);
+                                fclose(out_meta);
+                                LOGI("Dumped metadata, size: %zu", size);
+                            }
+                            break;
+                        }
+                    }
+                }
+                close(pipe_fds[0]);
+                close(pipe_fds[1]);
+            }
+        }
+    }
+    fclose(fp);
 }
 
 void il2cpp_dump(const char *outDir) {
     LOGI("dumping...");
     methodList.clear();
     dump_lib(outDir);
+    dump_metadata(outDir);
 
     size_t size;
     auto domain = il2cpp_domain_get();
