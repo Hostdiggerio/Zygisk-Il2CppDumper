@@ -13,6 +13,7 @@
 #include <fstream>
 #include <cstdio>
 #include <unistd.h>
+#include <fcntl.h>
 #include "xdl.h"
 #include "log.h"
 #include "il2cpp-tabledefs.h"
@@ -357,39 +358,74 @@ void il2cpp_api_init(void *handle) {
 }
 
 void dump_lib(const char *outDir) {
-    LOGI("dumping libil2cpp.so...");
-    uint64_t start = il2cpp_base;
-    uint64_t end = 0;
+    LOGI("dumping libil2cpp.so entirely from memory...");
+    auto outPath = std::string(outDir).append("/files/libil2cpp.so");
+    FILE *out = fopen(outPath.c_str(), "wb");
+    if (!out) {
+        LOGE("Failed to open libil2cpp.so for writing");
+        return;
+    }
+
+    int mem_fd = open("/proc/self/mem", O_RDONLY);
+    if (mem_fd < 0) {
+        LOGE("Failed to open /proc/self/mem");
+        fclose(out);
+        return;
+    }
+
     char line[1024];
     FILE *fp = fopen("/proc/self/maps", "rt");
-    if (fp) {
-        while (fgets(line, sizeof(line), fp)) {
-            if (strstr(line, "libil2cpp.so")) {
-                uintptr_t s, e;
-                if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &s, &e) == 2) {
-                    if (s == start || (s > start && (end == 0 || s == end))) {
-                        end = e;
+    if (!fp) {
+        LOGE("Failed to open /proc/self/maps");
+        close(mem_fd);
+        fclose(out);
+        return;
+    }
+
+    uint64_t lib_base = il2cpp_base;
+    uint64_t max_end = 0;
+
+    // First pass: find the maximum address mapped to libil2cpp.so
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "libil2cpp.so")) {
+            uint64_t s, e;
+            if (sscanf(line, "%" SCNx64 "-%" SCNx64, &s, &e) == 2) {
+                if (e > max_end) {
+                    max_end = e;
+                }
+            }
+        }
+    }
+
+    size_t total_size = max_end - lib_base;
+    LOGI("Total libil2cpp.so memory size roughly: %zu", total_size);
+
+    // Second pass: Read all memory regions mapped to libil2cpp.so and write to file at correct offsets
+    fseek(fp, 0, SEEK_SET);
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "libil2cpp.so")) {
+            uint64_t s, e;
+            if (sscanf(line, "%" SCNx64 "-%" SCNx64, &s, &e) == 2) {
+                if (s >= lib_base && s < max_end) {
+                    size_t region_size = e - s;
+                    size_t file_offset = s - lib_base;
+
+                    void* buf = malloc(region_size);
+                    if (buf) {
+                        pread(mem_fd, buf, region_size, s);
+                        fseek(out, file_offset, SEEK_SET);
+                        fwrite(buf, 1, region_size, out);
+                        free(buf);
                     }
                 }
             }
         }
-        fclose(fp);
     }
 
-    if (end > start) {
-        size_t size = end - start;
-        auto outPath = std::string(outDir).append("/files/libil2cpp.so");
-        FILE *out = fopen(outPath.c_str(), "wb");
-        if (out) {
-            fwrite((void *)start, 1, size, out);
-            fclose(out);
-            LOGI("libil2cpp.so dumped, size: %zu", size);
-        } else {
-            LOGE("Failed to open libil2cpp.so for writing");
-        }
-    } else {
-        LOGE("Failed to find libil2cpp.so memory range");
-    }
+    fclose(fp);
+    close(mem_fd);
+    fclose(out);
+    LOGI("libil2cpp.so fully dumped using /proc/self/mem! Final size: %zu", total_size);
 }
 
 void il2cpp_dump(const char *outDir) {
